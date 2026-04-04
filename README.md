@@ -61,27 +61,38 @@ Client Request (verify physician)
 
 ```
 medpoint-npi/
-├── docker-compose.yml          # Full local infrastructure
+├── docker-compose.yml
+├── pytest.ini
 ├── nginx/
-│   └── nginx.conf              # Load balancer config
+│   └── nginx.conf
+├── core/                        ← NEW
+│   ├── __init__.py              ← NEW (empty)
+│   └── models.py                ← NEW (NPIRecord, NPIAddress, NPITaxonomy, DCAResult + exceptions)
 ├── api/
-│   ├── main.py                 # FastAPI app
+│   ├── __init__.py
+│   ├── main.py
 │   ├── routes/
-│   │   └── verify.py           # POST /verify endpoint
-│   ├── services/
-│   │   ├── cache.py            # Redis cache logic
-│   │   └── producer.py         # Kafka producer
-│   └── models/
-│       └── physician.py        # Pydantic models
+│   │   ├── __init__.py
+│   │   └── verify.py
+│   └── services/
+│       ├── __init__.py
+│       ├── cache.py
+│       └── producer.py
+│   ← api/models/ REMOVED entirely
 ├── workers/
-│   ├── npi_fetcher.py          # NPI Registry API worker
-│   ├── dca_reader.py           # California DCA license worker
-│   ├── fuzzy_matcher.py        # RapidFuzz matching worker
-│   └── notification_worker.py  # Send results back to client
+│   ├── __init__.py
+│   ├── npi_fetcher.py           ← MODIFIED (imports from core/models)
+│   ├── dca_reader.py
+│   ├── fuzzy_matcher.py
+│   └── notification_worker.py
+├── data/
+│   └── medical_board.xlsx
 ├── db/
-│   └── schema.sql              # PostgreSQL table definitions
+│   └── schema.sql
 ├── tests/
-│   └── test_verify.py          # pytest suite
+│   ├── test_npi_fetcher.py      ← MODIFIED (update import paths)
+│   ├── test_dca_reader.py
+│   └── test_fuzzy_matcher.py
 └── requirements.txt
 ```
 
@@ -143,7 +154,7 @@ CREATE INDEX idx_physicians_name ON physicians(full_name);
 3. FastAPI checks Redis — cache miss
 4. FastAPI publishes to Kafka topic: verification_requested
 5. NPI Fetcher Worker consumes event → hits NPI Registry API
-6. DCA Reader Worker → checks California DCA license database
+6. DCA Reader Worker → queries DCA data source (see phases)
 7. Fuzzy Matcher Worker → validates name consistency with RapidFuzz
 8. Results stored in PostgreSQL
 9. Redis cache updated with TTL (24 hours)
@@ -208,27 +219,47 @@ def fetch_with_backoff(url, max_retries=4):
 | Database Indexing | PostgreSQL index on NPI column |
 | Horizontal Scaling | Multiple FastAPI + worker instances |
 | Data Validation | Pydantic models + schema enforcement |
+| Swappable Data Sources | DCA reader abstracted behind DCAResult model |
 
 ---
 
 ## 🏗️ Build Phases
 
-### ✅ Phase 1 — Completed (before this guide)
+### ✅ Phase 1 — Completed
 - Project scaffolding
-- NPI fetcher basic implementation
-- Pydantic models
-- pytest suite foundation
+- NPI fetcher implementation (`workers/npi_fetcher.py`)
+- Pydantic models (`NPIRecord`, `NPIAddress`, `NPITaxonomy`)
+- Custom exceptions (`NPINotFoundError`, `NPIAPIError`, `NPIValidationError`)
+- 23-test pytest suite passing
+- `pytest.ini` configured with `pythonpath = .`
+- `workers/__init__.py` created
 
-### 🔲 Phase 2 — Current Target
-- `dca_reader.py` — California DCA license lookup
-- `fuzzy_matcher.py` — RapidFuzz name matching
-- Basic pytest coverage for both
+### 🔲 Phase 2 — Current Target: DCA Local (Excel)
+> **Design decision:** The California DCA does not expose a public REST API.
+> Rather than block the pipeline, we use a locally downloaded Excel snapshot
+> from the DCA website as the data source. This lets us build and validate
+> the entire verification pipeline now. The data source is intentionally
+> abstracted — swapping to the live DCA site in Phase 2b requires changing
+> only `dca_reader.py`, nothing else.
+
+**Phase 2a — Local Excel lookup (current):**
+- Place downloaded DCA Excel file at `data/dca_licenses.xlsx`
+- `dca_reader.py` — loads Excel with `pandas`, queries by name/license number
+- Returns `DCAResult` model (same interface forever)
+- `fuzzy_matcher.py` — RapidFuzz name matching between NPI and DCA records
+- `test_dca_reader.py` — tests against fixture data (no HTTP mocking needed)
+- `test_fuzzy_matcher.py` — tests name pair scoring and verdict thresholds
+
+**Phase 2b — DCA API Integration (future, when API access is available):**
+- Replace internal logic of `dca_reader.py` only
+- `DCAResult` return model stays identical — pipeline unchanged
+- Add `responses` mock tests for HTTP layer
 
 ### 🔲 Phase 3 — Docker Infrastructure
 ```yaml
 # docker-compose.yml target
 services:
-  postgres, redis, kafka, zookeeper, 
+  postgres, redis, kafka, zookeeper,
   fastapi-1, fastapi-2, nginx, workers
 ```
 
@@ -288,9 +319,15 @@ pydantic
 rapidfuzz
 requests
 pytest
+responses
 locust
 python-dotenv
+pandas
+openpyxl
 ```
+
+> `pandas` + `openpyxl` — required for Phase 2a Excel lookup
+> `responses` — required for HTTP mocking in tests
 
 ---
 

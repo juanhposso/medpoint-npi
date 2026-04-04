@@ -1,5 +1,5 @@
 """
-tools/npi_fetcher.py
+workers/npi_fetcher.py
 ────────────────────────────────────────────────────────
 NPI Registry API client with Pydantic validation.
 
@@ -19,10 +19,9 @@ import os
 import re
 import logging
 from typing import Optional
-
 import requests
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator, model_validator
+from core.models import NPIAddress, NPITaxonomy, NPIRecord, NPINotFoundError, NPIAPIError, NPIValidationError
 
 load_dotenv()
 
@@ -35,131 +34,6 @@ NPI_API_BASE_URL: str = os.getenv("NPI_API_BASE_URL", "https://npiregistry.cms.h
 NPI_API_VERSION: str = os.getenv("NPI_API_VERSION", "2.1")
 NPI_REQUEST_TIMEOUT: int = int(os.getenv("NPI_REQUEST_TIMEOUT", "10"))
 
-
-# ──────────────────────────────────────────────────────────────────
-# Pydantic Models
-# ──────────────────────────────────────────────────────────────────
-
-class NPIAddress(BaseModel):
-    """Validated practice/mailing address."""
-
-    address_type: str = Field(..., description="LOCATION | MAILING")
-    address_1: str = ""
-    address_2: str = ""
-    city: str = ""
-    state: str = ""
-    postal_code: str = ""
-    telephone_number: Optional[str] = None
-    fax_number: Optional[str] = None
-
-    @field_validator("telephone_number", "fax_number", mode="before")
-    @classmethod
-    def normalise_phone(cls, v: Optional[str]) -> Optional[str]:
-        """Strip all non-digit characters; return None if empty."""
-        if not v:
-            return None
-        digits = re.sub(r"\D", "", v)
-        return digits if digits else None
-
-    @field_validator("postal_code", mode="before")
-    @classmethod
-    def normalise_zip(cls, v: str) -> str:
-        """Keep only first 5 digits of ZIP."""
-        if not v:
-            return ""
-        return re.sub(r"\D", "", v)[:5]
-
-    @field_validator("state", mode="before")
-    @classmethod
-    def upper_state(cls, v: str) -> str:
-        return v.upper().strip() if v else ""
-
-
-class NPITaxonomy(BaseModel):
-    """Primary specialty/taxonomy block."""
-
-    code: str = ""
-    description: str = ""
-    primary: bool = False
-    state: Optional[str] = None   # state licence issued in (if any)
-    license: Optional[str] = None
-
-
-class NPIRecord(BaseModel):
-    """
-    Canonical representation of a single physician NPI record.
-    All fields consumed downstream (fuzzy matching, LangGraph agents).
-    """
-
-    npi: str
-    first_name: str = ""
-    last_name: str = ""
-    credential: str = ""          # e.g. "MD", "DO", "NP"
-    gender: Optional[str] = None
-
-    primary_taxonomy: Optional[NPITaxonomy] = None
-    location_address: Optional[NPIAddress] = None  # preferred for matching
-    mailing_address: Optional[NPIAddress] = None
-
-    # Convenience aliases resolved by model_validator
-    telephone: Optional[str] = None
-    fax: Optional[str] = None
-
-    @field_validator("npi")
-    @classmethod
-    def validate_npi(cls, v: str) -> str:
-        v = v.strip()
-        if not re.fullmatch(r"\d{10}", v):
-            raise ValueError(f"NPI must be exactly 10 digits, got: '{v}'")
-        return v
-
-    @field_validator("credential", mode="before")
-    @classmethod
-    def clean_credential(cls, v: Optional[str]) -> str:
-        """Remove punctuation and normalise to upper-case."""
-        if not v:
-            return ""
-        return re.sub(r"[^A-Za-z]", "", v).upper()
-
-    @model_validator(mode="after")
-    def resolve_contact(self) -> NPIRecord:
-        """
-        Populate top-level telephone/fax from the LOCATION address first,
-        falling back to MAILING so downstream code has a single contact field.
-        """
-        preferred = self.location_address or self.mailing_address
-        if preferred:
-            self.telephone = preferred.telephone_number
-            self.fax = preferred.fax_number
-        return self
-
-    @property
-    def full_name(self) -> str:
-        parts = filter(None, [self.first_name, self.last_name])
-        name = " ".join(parts)
-        if self.credential:
-            name = f"{name}, {self.credential}"
-        return name
-
-    @property
-    def specialty(self) -> str:
-        return self.primary_taxonomy.description if self.primary_taxonomy else ""
-
-
-# ──────────────────────────────────────────────────────────────────
-# Custom Exceptions
-# ──────────────────────────────────────────────────────────────────
-
-class NPINotFoundError(Exception):
-    """Raised when the NPI number returns zero results."""
-
-
-class NPIAPIError(Exception):
-    """Raised on HTTP errors or unexpected API responses."""
-
-
-class NPIValidationError(Exception):
-    """Raised when Pydantic validation fails for a raw API payload."""
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -264,7 +138,7 @@ def fetch_npi(npi_number: str) -> NPIRecord:
     except requests.exceptions.ConnectionError as exc:
         raise NPIAPIError(f"Connection error for NPI {npi_number}: {exc}") from exc
     except requests.exceptions.HTTPError as exc:
-        raise NPIAPIError(f"HTTP {response.status_code} for NPI {npi_number}: {exc}") from exc
+        raise NPIAPIError(f"HTTP {exc.response.status_code} for NPI {npi_number}: {exc}") from exc
 
     try:
         payload = response.json()

@@ -7,16 +7,9 @@ Run with:  pytest tests/ -v
 
 import pytest
 import responses as rsps
-from responses import matchers
-
+from core.models import NPIRecord, NPIAddress, NPITaxonomy, NPINotFoundError, NPIAPIError, NPIValidationError
 from workers.npi_fetcher import (
     fetch_npi,
-    NPIRecord,
-    NPIAddress,
-    NPITaxonomy,
-    NPINotFoundError,
-    NPIAPIError,
-    NPIValidationError,
     _pick_primary_taxonomy,
     _pick_address,
     _parse_result,

@@ -36,9 +36,7 @@ NPI_REQUEST_TIMEOUT: int = int(os.getenv("NPI_REQUEST_TIMEOUT", "10"))
 
 
 
-# ──────────────────────────────────────────────────────────────────
-# Internal helpers
-# ──────────────────────────────────────────────────────────────────
+
 
 def _pick_primary_taxonomy(taxonomies: list[dict]) -> Optional[NPITaxonomy]:
     """Return the taxonomy block flagged as primary; fall back to first."""

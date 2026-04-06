@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import logging
+from datetime import date
 from typing import Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -129,6 +130,23 @@ class NPIRecord(BaseModel):
     @property
     def specialty(self) -> str:
         return self.primary_taxonomy.description if self.primary_taxonomy else ""
+    
+class DCAResult(BaseModel):
+    """
+    Canonical representation of a DCA license record.
+    This interface never changes — only dca_reader.py internals swap
+    when we move from Excel to the live DCA API.
+    """
+    license_number: str
+    last_name: str
+    first_name: str
+    middle_name: Optional[str] = None
+    license_type: str
+    license_status: str
+    expiration_date: date
+    original_issue_date: date
+    is_valid: bool # derived: status == "Current" and not expired
+
 
 
 # ──────────────────────────────────────────────────────────────────

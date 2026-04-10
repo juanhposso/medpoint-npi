@@ -30,6 +30,11 @@ else:
 def query_by_license(license_number: str) -> DCAResult | None:
     """Find a license by its number and return a DCAResult instance."""
 
+    try:
+        license_number = int(license_number) # type: ignore
+    except ValueError:
+        return None
+
     row = full_data[full_data['License Number'] == int(license_number)]
 
     if row.empty:

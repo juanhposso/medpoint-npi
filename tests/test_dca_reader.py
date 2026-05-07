@@ -1,48 +1,92 @@
+"""
+tests/test_dca_reader.py
+─────────────────────────
+Tests for the Postgres-backed dca_reader.py (Phase 3G).
+
+Strategy: mock _get_connection() so no real DB is needed.
+RealDictCursor rows are plain dicts with lowercase keys — that's what
+_row_to_dca_result() expects, so our fake rows match that format exactly.
+
+All assertions are identical to the pandas version — the DCAResult
+contract is unchanged. Only the mocking strategy changed.
+"""
+
 import pytest
-import pandas as pd
-import numpy as np
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch, call
 from datetime import date
 
 from workers.dca_reader import query_by_license, query_by_name
 
 
-FAKE_DATA = pd.DataFrame([
-    {
-        'License Number': 12345,
-        'Org/Last Name': 'SMITH',
-        'First Name': 'JOHN',
-        'Middle Name': 'A',
-        'License Type': 'Physician and Surgeon',
-        'License Status': 'Current',
-        'Original Issue Date': pd.Timestamp('2010-01-15'),
-        'Expiration Date': pd.Timestamp('2028-01-31'),
-    },
-    {
-        'License Number': 99999,
-        'Org/Last Name': 'DOE',
-        'First Name': 'JANE',
-        'Middle Name': np.nan,       # ← tests NaN handling
-        'License Type': 'Physician and Surgeon',
-        'License Status': 'Expired',
-        'Original Issue Date': pd.Timestamp('2005-03-01'),
-        'Expiration Date': pd.Timestamp('2022-01-31'),
-    },
-])
+# ─── Fake rows ────────────────────────────────────────────────────────────────
+# These mirror what psycopg2 RealDictCursor returns — plain dicts,
+# lowercase keys matching column names, Python date objects for dates.
+
+SMITH_ROW = {
+    'license_number':      '12345',
+    'last_name':           'SMITH',
+    'first_name':          'JOHN',
+    'middle_name':         'A',
+    'license_type':        'Physician and Surgeon',
+    'license_status':      'Current',
+    'original_issue_date': date(2010, 1, 15),
+    'expiration_date':     date(2028, 1, 31),
+}
+
+DOE_ROW = {
+    'license_number':      '99999',
+    'last_name':           'DOE',
+    'first_name':          'JANE',
+    'middle_name':         None,   # ← NULL in Postgres, tests NaN handling parity
+    'license_type':        'Physician and Surgeon',
+    'license_status':      'Expired',
+    'original_issue_date': date(2005, 3, 1),
+    'expiration_date':     date(2022, 1, 31),
+}
+
+SMITH_ROW_2 = {
+    'license_number':      '54321',
+    'last_name':           'SMITH',
+    'first_name':          'JOHN',
+    'middle_name':         'B',
+    'license_type':        'Physician and Surgeon',
+    'license_status':      'Current',
+    'original_issue_date': date(2015, 5, 20),
+    'expiration_date':     date(2025, 5, 31),
+}
 
 
-@pytest.fixture(autouse=True)
-def mock_full_data():
-    with patch('workers.dca_reader.full_data', FAKE_DATA):
-        yield
+# ─── Mock builder ─────────────────────────────────────────────────────────────
+
+def make_mock_conn(fetchone=None, fetchall=None):
+    """
+    Build a mock connection whose cursor returns the given fake rows.
+    Mirrors the _cursor() context manager:
+        conn.cursor(cursor_factory=...) → cursor
+        cursor.fetchone() / cursor.fetchall()
+    """
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = fetchone
+    mock_cursor.fetchall.return_value = fetchall or []
+
+    # cursor is used as a context manager: `with conn.cursor(...) as cur`
+    mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+    mock_cursor.__exit__ = MagicMock(return_value=False)
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+
+    return mock_conn
 
 
-# ══════════════════════════════════════════════════════════════════
-# 1. Tests for query_by_license
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# query_by_license
+# ══════════════════════════════════════════════════════════════════════════════
 
 def test_query_by_license_valid():
-    result = query_by_license('12345')
+    with patch('workers.dca_reader._get_connection', return_value=make_mock_conn(fetchone=SMITH_ROW)):
+        result = query_by_license('12345')
+
     assert result is not None
     assert result.license_number == '12345'
     assert result.last_name == 'SMITH'
@@ -53,54 +97,76 @@ def test_query_by_license_valid():
     assert result.original_issue_date == date(2010, 1, 15)
     assert result.expiration_date == date(2028, 1, 31)
     assert result.is_valid is True
+
 
 def test_query_by_license_invalid():
-    result = query_by_license('00000')
+    # License number not found — fetchone returns None
+    with patch('workers.dca_reader._get_connection', return_value=make_mock_conn(fetchone=None)):
+        result = query_by_license('00000')
+
     assert result is None
 
+
 def test_query_by_license_expired():
-    result = query_by_license('99999')
+    with patch('workers.dca_reader._get_connection', return_value=make_mock_conn(fetchone=DOE_ROW)):
+        result = query_by_license('99999')
+
     assert result is not None
     assert result.license_number == '99999'
     assert result.last_name == 'DOE'
     assert result.first_name == 'JANE'
-    assert result.middle_name is None  # ← tests NaN handling
+    assert result.middle_name is None   # ← NULL from Postgres → None in Python
     assert result.license_type == 'Physician and Surgeon'
     assert result.license_status == 'Expired'
     assert result.original_issue_date == date(2005, 3, 1)
     assert result.expiration_date == date(2022, 1, 31)
     assert result.is_valid is False
 
+
 def test_query_by_license_non_numeric():
-    result = query_by_license('ABCDE')
+    # No DB call should be made — int('ABCDE') raises ValueError before querying
+    with patch('workers.dca_reader._get_connection') as mock_conn:
+        result = query_by_license('ABCDE')
+
     assert result is None
+    mock_conn.assert_not_called()   # confirms we short-circuit before hitting DB
+
 
 def test_query_by_license_leading_zeros():
-    result = query_by_license('00012345')
+    # '00012345' normalises to '12345' via str(int(license_number))
+    with patch('workers.dca_reader._get_connection', return_value=make_mock_conn(fetchone=SMITH_ROW)):
+        result = query_by_license('00012345')
+
     assert result is not None
     assert result.license_number == '12345'
 
 
-# ══════════════════════════════════════════════════════════════════
-# 1. Tests for query_by_name
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# query_by_name
+# ══════════════════════════════════════════════════════════════════════════════
 
 def test_query_by_name_valid():
-    results = query_by_name('DOE', 'JANE')
+    with patch('workers.dca_reader._get_connection', return_value=make_mock_conn(fetchall=[DOE_ROW])):
+        results = query_by_name('DOE', 'JANE')
+
     assert len(results) == 1
     result = results[0]
     assert result.license_number == '99999'
     assert result.last_name == 'DOE'
     assert result.first_name == 'JANE'
-    assert result.middle_name is None  # ← tests NaN handling
+    assert result.middle_name is None
     assert result.license_type == 'Physician and Surgeon'
     assert result.license_status == 'Expired'
     assert result.original_issue_date == date(2005, 3, 1)
     assert result.expiration_date == date(2022, 1, 31)
     assert result.is_valid is False
 
+
 def test_query_by_name_case_insensitive():
-    results = query_by_name('smith', 'john')
+    # SQL uses UPPER() on both sides — lowercase input still matches
+    with patch('workers.dca_reader._get_connection', return_value=make_mock_conn(fetchall=[SMITH_ROW])):
+        results = query_by_name('smith', 'john')
+
     assert len(results) == 1
     result = results[0]
     assert result.license_number == '12345'
@@ -113,26 +179,18 @@ def test_query_by_name_case_insensitive():
     assert result.expiration_date == date(2028, 1, 31)
     assert result.is_valid is True
 
+
 def test_query_by_name_no_match():
-    results = query_by_name('NONEXISTENT', 'NAME')
+    with patch('workers.dca_reader._get_connection', return_value=make_mock_conn(fetchall=[])):
+        results = query_by_name('NONEXISTENT', 'NAME')
+
     assert len(results) == 0
 
+
 def test_query_by_name_multiple_matches():
-    # Add a duplicate entry to test multiple matches
-    duplicate_data = pd.DataFrame([
-        {
-            'License Number': 54321,
-            'Org/Last Name': 'SMITH',
-            'First Name': 'JOHN',
-            'Middle Name': 'B',
-            'License Type': 'Physician and Surgeon',
-            'License Status': 'Current',
-            'Original Issue Date': pd.Timestamp('2015-05-20'),
-            'Expiration Date': pd.Timestamp('2025-05-31'),
-        }
-    ])
-    with patch('workers.dca_reader.full_data', pd.concat([FAKE_DATA, duplicate_data], ignore_index=True)):
+    with patch('workers.dca_reader._get_connection', return_value=make_mock_conn(fetchall=[SMITH_ROW, SMITH_ROW_2])):
         results = query_by_name('SMITH', 'JOHN')
-        assert len(results) == 2
-        license_numbers = {result.license_number for result in results}
-        assert license_numbers == {'12345', '54321'}
+
+    assert len(results) == 2
+    license_numbers = {result.license_number for result in results}
+    assert license_numbers == {'12345', '54321'}

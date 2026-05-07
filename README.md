@@ -57,46 +57,52 @@ Client Request (verify physician)
 
 ---
 
-## 📁 Project Structure (current state after Phase 2A)
+## 📁 Project Structure (current state after Phase 3)
 
 ```
 medpoint-npi/
-├── docker-compose.yml          # Full local infrastructure (Phase 3 target)
-├── pytest.ini                  # pythonpath = . (required for imports)
+├── Dockerfile                   # Shared image — FastAPI + workers, no CMD (set per service)
+├── docker-compose.yml           # Full local infrastructure ✅ Phase 3
+├── .env                         # Local secrets — never committed (in .gitignore)
+├── .env.example                 # Committed template — placeholder values only
+├── .env.local                   # WSL2 host overrides (POSTGRES_HOST=localhost:5433) — never committed
+├── pytest.ini                   # pythonpath = . (required for imports)
 ├── nginx/
-│   └── nginx.conf              # Load balancer config (Phase 3 target)
-├── core/                       # ← NEW in Phase 2A: shared layer, no layer owns models
+│   └── nginx.conf               # Load balancer — upstream: fastapi-1:8000, fastapi-2:8000 ✅ Phase 3
+├── core/                        # Shared layer — no other layer owns models
 │   ├── __init__.py
-│   ├── models.py               # NPIRecord, NPIAddress, NPITaxonomy, DCAResult + all exceptions
-│   └── matching.py             # MatchVerdict (Enum), MatchResult (Pydantic)
+│   ├── models.py                # NPIRecord, NPIAddress, NPITaxonomy, DCAResult + all exceptions
+│   └── matching.py              # MatchVerdict (Enum), MatchResult (Pydantic)
 ├── api/
 │   ├── __init__.py
-│   ├── main.py                 # FastAPI app (Phase 4 target)
+│   ├── main.py                  # FastAPI app (Phase 4 target)
 │   ├── routes/
 │   │   ├── __init__.py
-│   │   └── verify.py           # POST /verify endpoint (Phase 4 target)
+│   │   └── verify.py            # POST /verify endpoint (Phase 4 target)
 │   └── services/
 │       ├── __init__.py
-│       ├── cache.py            # Redis cache logic (Phase 4 target)
+│       ├── cache.py             # Redis cache logic (Phase 4 target)
 │       └── producer.py         # Kafka producer (Phase 4 target)
 │   # NOTE: api/models/ does NOT exist — models live in core/ to avoid
 │   # wrong dependency direction (workers importing from api/)
 ├── workers/
 │   ├── __init__.py
-│   ├── npi_fetcher.py          # NPI Registry API client — imports models from core/
-│   ├── dca_reader.py           # DCA license lookup (Excel-backed, Phase 2A ✅)
-│   ├── fuzzy_matcher.py        # RapidFuzz name matching (Phase 2A ✅)
+│   ├── npi_fetcher.py           # NPI Registry API client — imports models from core/
+│   ├── dca_reader.py            # DCA license lookup — PostgreSQL-backed ✅ Phase 3
+│   ├── fuzzy_matcher.py         # RapidFuzz name matching ✅ Phase 2A
 │   └── notification_worker.py  # Send results back to client (Phase 5 target)
 ├── data/
-│   └── medical_board.xlsx      # Local DCA snapshot — California Medical Board
+│   └── medical_board.xlsx       # Local DCA snapshot — California Medical Board
 │   # NOTE: original source file is .xls (HTML disguised as Excel, unreadable by pandas)
 │   # Solution: open in Google Sheets → download as .xlsx → use openpyxl engine
 ├── db/
-│   └── schema.sql              # PostgreSQL table definitions
+│   ├── schema.sql               # PostgreSQL table definitions ✅ Phase 3
+│   └── seed_dca.py              # Loads medical_board.xlsx → PostgreSQL ✅ Phase 3
+│   # 216,963 rows inserted, 3 skipped (NaT dates), batch size 1,000
 ├── tests/
-│   ├── test_verify.py          # 23 tests — Phase 1 ✅ (NPI models + helpers)
-│   ├── test_dca_reader.py      # 9 tests — Phase 2A ✅
-│   └── test_fuzzy_matcher.py   # 3 tests — Phase 2A ✅
+│   ├── test_verify.py           # 23 tests — Phase 1 ✅
+│   ├── test_dca_reader.py       # 9 tests — Phase 3 ✅ (rewritten for Postgres mocks)
+│   └── test_fuzzy_matcher.py    # 3 tests — Phase 2A ✅
 └── requirements.txt
 ```
 
@@ -106,14 +112,46 @@ medpoint-npi/
 
 ## 🐳 Infrastructure Stack
 
-| Service | Purpose | Port |
+| Service | Purpose | Host Port | Container Port |
+|---|---|---|---|
+| Nginx | Load balancer | 80 | 80 |
+| FastAPI (x2) | API servers | 8001, 8002 | 8000 |
+| Redis | Cache + deduplication | 6379 | 6379 |
+| Kafka | Message queue | 9092 | 29092 (internal) |
+| Zookeeper | Kafka coordinator | 2181 | 2181 |
+| PostgreSQL | Persistent storage | 5433 | 5432 |
+
+> **Port note:** PostgreSQL is mapped to `5433` on the host to avoid conflicts with any local Postgres instance. Inside Docker the service is always `postgres:5432`.
+
+---
+
+## 🐳 Docker Boot Order
+
+Services start in dependency order enforced by `depends_on` + `condition: service_healthy`:
+
+```
+Zookeeper → (healthy?) → Kafka
+Postgres  → (healthy?) → ┐
+Redis     → (healthy?) → ┴→ fastapi-1, fastapi-2 → Nginx
+```
+
+---
+
+## 🐳 Environment Configuration
+
+Two `.env` files — same codebase, different contexts:
+
+| File | Context | Committed? |
 |---|---|---|
-| Nginx | Load balancer | 80 |
-| FastAPI (x2) | API servers | 8001, 8002 |
-| Redis | Cache + deduplication | 6379 |
-| Kafka | Message queue | 9092 |
-| Zookeeper | Kafka coordinator | 2181 |
-| PostgreSQL | Persistent storage | 5432 |
+| `.env` | Docker (POSTGRES_HOST=postgres, PORT=5432) | No — in .gitignore |
+| `.env.example` | Template with placeholder values | Yes |
+| `.env.local` | WSL2 host overrides (POSTGRES_HOST=localhost, PORT=5433) | No — in .gitignore |
+
+Code loads both with `.env.local` winning on conflict:
+```python
+load_dotenv()                             # loads .env
+load_dotenv(".env.local", override=True)  # .env.local wins if it exists
+```
 
 ---
 
@@ -133,21 +171,34 @@ medpoint-npi/
 
 ```sql
 CREATE TABLE physicians (
-    id              SERIAL PRIMARY KEY,
-    npi             VARCHAR(10) UNIQUE NOT NULL,
-    full_name       VARCHAR(255),
-    specialty       VARCHAR(255),
-    taxonomy_code   VARCHAR(50),
-    dca_license     VARCHAR(100),
-    address         TEXT,
-    is_active       BOOLEAN DEFAULT TRUE,
-    verified_at     TIMESTAMP DEFAULT NOW(),
-    created_at      TIMESTAMP DEFAULT NOW()
+    license_number          TEXT        PRIMARY KEY,
+    last_name               TEXT        NOT NULL,
+    first_name              TEXT        NOT NULL,
+    middle_name             TEXT,                   -- nullable
+    license_type            TEXT        NOT NULL,
+    license_status          TEXT        NOT NULL,
+    original_issue_date     DATE        NOT NULL,
+    expiration_date         DATE        NOT NULL
+    -- is_valid is NOT stored — computed in Python by dca_reader.py
+    -- CURRENT_DATE is not immutable, so it cannot be a Postgres generated column
 );
 
-CREATE INDEX idx_physicians_npi ON physicians(npi);
-CREATE INDEX idx_physicians_name ON physicians(full_name);
+-- Functional index — required for UPPER() queries
+-- Without this, WHERE UPPER(last_name) = 'SMITH' triggers a full Seq Scan
+CREATE INDEX idx_physicians_name_upper
+    ON physicians (UPPER(last_name), UPPER(first_name));
+
+CREATE INDEX idx_physicians_status
+    ON physicians (license_status);
 ```
+
+**Performance result (Phase 3H):**
+| Query | Plan | Execution Time |
+|---|---|---|
+| Before functional index | Parallel Seq Scan — 92,138 rows scanned | 59ms |
+| After functional index | Bitmap Index Scan — 1 block read | 0.137ms |
+
+**430x improvement** from a single functional index.
 
 ---
 
@@ -225,10 +276,15 @@ class MatchResult(BaseModel):
 
 ## 📋 DCA Reader Design (workers/dca_reader.py)
 
-**Data source:** `data/medical_board.xlsx` — California Medical Board snapshot
-**Engine:** `openpyxl` (file is .xlsx format despite .xls origin)
+**Phase 3 internals:** PostgreSQL via `psycopg2` — Excel/pickle replaced
+**Public interface:** Identical to Phase 2A — `DCAResult` contract unchanged, all 35 tests pass
 
-**Pickle cache:** On first run, DataFrame is cached to `data/dca_data.pkl` to avoid reading Excel on every startup. Tech debt flag: corrupted `.pkl` serves bad data silently — acceptable for Phase 2A, replaced by PostgreSQL in Phase 3.
+**Key implementation details:**
+- `RealDictCursor` — rows returned as dicts (`row['license_number']`) instead of tuples
+- `@contextmanager _cursor()` — guarantees connection closes even on exceptions
+- `is_valid` computed in Python: `status == 'Current' and expiration_date >= date.today()`
+- Leading zeros normalized: `str(int(license_number))` → `'00012345'` finds `'12345'`
+- Case-insensitive queries: `WHERE UPPER(last_name) = UPPER(%s)` — uses functional index
 
 **Public functions:**
 - `query_by_license(license_number: str) → DCAResult | None`
@@ -237,18 +293,18 @@ class MatchResult(BaseModel):
 - `query_by_name(last_name: str, first_name: str) → list[DCAResult]`
   - Case-insensitive matching on both fields
 
-**Column mapping from Excel:**
-| Excel Column | DCAResult Field |
-|---|---|
-| `License Number` | `license_number` |
-| `Org/Last Name` | `last_name` |
-| `First Name` | `first_name` |
-| `Middle Name` | `middle_name` |
-| `License Type` | `license_type` |
-| `License Status` | `license_status` |
-| `Expiration Date` | `expiration_date` |
-| `Original Issue Date` | `original_issue_date` |
-| derived | `is_valid` |
+**Column mapping (Excel → Postgres → DCAResult):**
+| Excel Column | Postgres Column | DCAResult Field |
+|---|---|---|
+| `License Number` | `license_number` | `license_number` |
+| `Org/Last Name` | `last_name` | `last_name` |
+| `First Name` | `first_name` | `first_name` |
+| `Middle Name` | `middle_name` | `middle_name` |
+| `License Type` | `license_type` | `license_type` |
+| `License Status` | `license_status` | `license_status` |
+| `Expiration Date` | `expiration_date` | `expiration_date` |
+| `Original Issue Date` | `original_issue_date` | `original_issue_date` |
+| derived | — | `is_valid` |
 
 **Phase 2b (future):** When DCA API becomes available, replace only the internals of `dca_reader.py`. `DCAResult` interface stays identical — pipeline unchanged, tests still pass.
 
@@ -263,7 +319,7 @@ class MatchResult(BaseModel):
 3. FastAPI checks Redis — cache miss
 4. FastAPI publishes to Kafka topic: verification_requested
 5. NPI Fetcher Worker consumes event → hits NPI Registry API
-6. DCA Reader Worker → queries DCA data source (Excel in Phase 2A, PostgreSQL in Phase 3+)
+6. DCA Reader Worker → queries PostgreSQL physicians table
 7. Fuzzy Matcher Worker → validates name consistency with RapidFuzz
 8. Results stored in PostgreSQL
 9. Redis cache updated with TTL (24 hours)
@@ -325,11 +381,13 @@ def fetch_with_backoff(url, max_retries=4):
 | Dead Letter Queue | Failed verifications after retries |
 | Exponential Backoff | API retry logic in workers |
 | Deduplication | Redis prevents duplicate notifications |
-| Database Indexing | PostgreSQL index on NPI column |
+| Database Indexing | Functional index on UPPER(last_name, first_name) |
 | Horizontal Scaling | Multiple FastAPI + worker instances |
 | Data Validation | Pydantic models + schema enforcement |
-| Swappable Data Sources | DCAResult interface abstracts Excel → API swap |
+| Swappable Data Sources | DCAResult interface abstracts Excel → Postgres → API |
 | Dependency Direction | core/ layer prevents workers importing from api/ |
+| Docker Healthchecks | Boot order enforced via condition: service_healthy |
+| Env Context Separation | .env (Docker) + .env.local (WSL2 host) pattern |
 
 ---
 
@@ -359,17 +417,17 @@ def fetch_with_backoff(url, max_retries=4):
 - `DCAResult` return model stays identical — pipeline unchanged
 - Add `responses` mock tests for HTTP layer
 
-### 🔲 Phase 3 — Docker Infrastructure
-```yaml
-# docker-compose.yml target
-services:
-  postgres, redis, kafka, zookeeper,
-  fastapi-1, fastapi-2, nginx, workers
-```
-- Load DCA data from Excel into PostgreSQL
-- Swap `dca_reader.py` internals to query PostgreSQL instead of Excel
-- `DCAResult` interface unchanged — proves abstraction works
-- Performance difference: pandas O(n) scan → PostgreSQL O(log n) indexed query
+### ✅ Phase 3 — Docker Infrastructure — Completed
+- `Dockerfile` — single shared image, FastAPI + workers use different `command:` per service
+- `docker-compose.yml` — 6 services with healthchecks and enforced boot order
+- `nginx/nginx.conf` — upstream fixed to Docker service names (`fastapi-1:8000`)
+- `.env` / `.env.example` / `.env.local` — dual-context environment configuration
+- `db/schema.sql` — `physicians` table with functional index on `UPPER(last_name, first_name)`
+- `db/seed_dca.py` — batch loader (1,000 rows/insert), 216,963 rows inserted, 3 skipped
+- `workers/dca_reader.py` — swapped to PostgreSQL, `DCAResult` interface unchanged
+- `tests/test_dca_reader.py` — rewritten to mock `_get_connection` instead of `full_data`
+- **35 tests still passing — abstraction proved**
+- **Performance: 59ms → 0.137ms (430x) via functional index**
 
 ### 🔲 Phase 4 — FastAPI + Kafka Integration
 - `POST /verify` endpoint

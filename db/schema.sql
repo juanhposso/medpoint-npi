@@ -14,28 +14,24 @@
 CREATE TABLE IF NOT EXISTS physicians (
 
     -- Primary key — DCA license numbers are unique per physician
-    license_number          VARCHAR(50)     PRIMARY KEY,
+    license_number          TEXT    PRIMARY KEY,
 
     -- Name fields — match DCAResult exactly
-    last_name               VARCHAR(100)    NOT NULL,
-    first_name              VARCHAR(100)    NOT NULL,
-    middle_name             VARCHAR(100),   -- nullable: Optional[str] in DCAResult
+    last_name               TEXT    NOT NULL,
+    first_name              TEXT    NOT NULL,
+    middle_name             TEXT,   -- nullable: Optional[str] in DCAResult
 
     -- License metadata
-    license_type            VARCHAR(100)    NOT NULL,
-    license_status          VARCHAR(50)     NOT NULL,
+    license_type            TEXT    NOT NULL,
+    license_status          TEXT    NOT NULL,
 
     -- Dates — stored as DATE, matches Python date type in DCAResult
     original_issue_date     DATE            NOT NULL,
-    expiration_date         DATE            NOT NULL,
+    expiration_date         DATE            NOT NULL
 
-    -- Derived field — Postgres computes this automatically on every read.
-    -- Mirrors DCAResult.is_valid: status == "Current" and not expired.
-    -- STORED means it's physically saved and can be indexed (Phase 6+).
-    is_valid                BOOLEAN         GENERATED ALWAYS AS (
-                                license_status = 'Current'
-                                AND expiration_date >= CURRENT_DATE
-                            ) STORED
+    -- is_valid is NOT stored in the database.
+    -- It depends on CURRENT_DATE which changes daily — cannot be a generated column.
+    -- Computed in Python by _row_to_dca_result() in dca_reader.py.
 
 );
 
